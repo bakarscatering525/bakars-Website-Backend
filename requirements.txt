@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+motor
+pydantic
+pydantic-settings
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+stripe
+boto3
+requests
+googlemaps
+python-dotenv
+email-validator
+httpx
+Pillow  # For test image creation (optional)
+dnspython
