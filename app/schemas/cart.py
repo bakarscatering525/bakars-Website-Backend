@@ -9,6 +9,7 @@ class CartItem(BaseModel):
     quantity: int
     price: float
     subtotal: float
+    variation_size: Optional[str] = None
 
 class CartSummary(BaseModel):
     """Cart summary"""
@@ -22,7 +23,9 @@ class AddToCartRequest(BaseModel):
     """Add to cart request"""
     item_id: str
     quantity: int = 1
+    variation_size: Optional[str] = None
 
 class UpdateCartItemRequest(BaseModel):
     """Update cart item request"""
     quantity: int
+    variation_size: Optional[str] = None

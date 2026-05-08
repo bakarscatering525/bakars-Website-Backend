@@ -26,6 +26,7 @@ class MenuItemModel(BaseModel):
     description: Optional[str] = None
     category: str  # rice, curry, bbq, sweets, drinks
     price: float
+    variations: List[Dict] = []  # Size variations: [{size: "small", price: 10.99, is_available: true}, ...]
     image_url: Optional[str] = None
     is_available: bool = True
     is_available_for_daily: bool = True

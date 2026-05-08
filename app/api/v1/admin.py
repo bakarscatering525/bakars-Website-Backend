@@ -150,6 +150,7 @@ def menu_item_form_params(
     availability_scope: Optional[str] = Form(
         None, description="daily | meal_plan | both (optional override)"
     ),
+    variations: Optional[str] = Form(None, description="JSON string of menu item variations"),
 ) -> Dict[str, Any]:
     """Collect common menu item creation form parameters."""
     return {
@@ -164,6 +165,7 @@ def menu_item_form_params(
         "is_vegetarian": is_vegetarian,
         "is_halal": is_halal,
         "availability_scope": availability_scope,
+        "variations": variations,
     }
 
 
@@ -183,6 +185,27 @@ async def _create_menu_item_from_form(
             form_data.get("is_available_for_meal_plan"),
         )
 
+        # Parse variations if provided
+        variations = None
+        if form_data.get("variations"):
+            try:
+                variations = json.loads(form_data["variations"])
+                # Validate variations structure
+                if not isinstance(variations, list):
+                    raise ValueError("Variations must be a list")
+                for var in variations:
+                    if not isinstance(var, dict) or "size" not in var or "price" not in var:
+                        raise ValueError("Each variation must have 'size' and 'price' fields")
+                    if var["size"] not in ["small", "medium", "large"]:
+                        raise ValueError("Variation size must be 'small', 'medium', or 'large'")
+                    if not isinstance(var["price"], (int, float)) or var["price"] < 0:
+                        raise ValueError("Variation price must be a non-negative number")
+            except (json.JSONDecodeError, ValueError) as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid variations format: {str(e)}"
+                )
+
         item_payload = {
             "name": form_data["name"],
             "category": form_data["category"],
@@ -194,6 +217,7 @@ async def _create_menu_item_from_form(
             "spice_level": form_data.get("spice_level"),
             "is_vegetarian": form_data.get("is_vegetarian", False),
             "is_halal": form_data.get("is_halal", True),
+            "variations": variations,
         }
 
         created_item = await menu_service.create_menu_item(item_payload, image_url)
@@ -516,6 +540,7 @@ async def update_menu_item(
     spice_level: Optional[str] = Form(None),
     is_vegetarian: Optional[bool] = Form(None),
     is_halal: Optional[bool] = Form(None),
+    variations: Optional[str] = Form(None, description="JSON string of menu item variations"),
     image: Optional[UploadFile] = File(None),
     remove_image: bool = Form(False),
     current_admin = Depends(get_current_admin)
@@ -551,6 +576,30 @@ async def update_menu_item(
             update_data["is_halal"] = is_halal
         if allergens is not None:
             update_data["allergens"] = parse_allergens_field(allergens)
+
+        # Handle variations
+        if variations is not None:
+            if variations.strip() == "":
+                update_data["variations"] = []
+            else:
+                try:
+                    parsed_variations = json.loads(variations)
+                    # Validate variations structure
+                    if not isinstance(parsed_variations, list):
+                        raise ValueError("Variations must be a list")
+                    for var in parsed_variations:
+                        if not isinstance(var, dict) or "size" not in var or "price" not in var:
+                            raise ValueError("Each variation must have 'size' and 'price' fields")
+                        if var["size"] not in ["small", "medium", "large"]:
+                            raise ValueError("Variation size must be 'small', 'medium', or 'large'")
+                        if not isinstance(var["price"], (int, float)) or var["price"] < 0:
+                            raise ValueError("Variation price must be a non-negative number")
+                    update_data["variations"] = parsed_variations
+                except (json.JSONDecodeError, ValueError) as e:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Invalid variations format: {str(e)}"
+                    )
         
         # Handle image
         if remove_image:

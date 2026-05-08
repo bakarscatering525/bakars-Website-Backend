@@ -27,6 +27,12 @@ class CategoryResponse(BaseModel):
             sort_order=category.sort_order
         )
 
+class MenuItemVariation(BaseModel):
+    """Menu item variation (size-based pricing)"""
+    size: str = Field(..., pattern="^(small|medium|large)$")
+    price: float = Field(..., gt=0)
+    is_available: bool = True
+
 class MenuItemResponse(BaseModel):
     """Menu item response"""
     id: str
@@ -35,6 +41,7 @@ class MenuItemResponse(BaseModel):
     description: Optional[str] = None
     category: str
     price: float
+    variations: List[MenuItemVariation] = []
     image_url: Optional[str] = None
     is_available: bool
     is_available_for_daily: bool
@@ -62,6 +69,7 @@ class MenuItemResponse(BaseModel):
             description=item.description,
             category=item.category,
             price=item.price,
+            variations=getattr(item, 'variations', []) or [],
             image_url=item.image_url,
             is_available=item.is_available,
             is_available_for_daily=item.is_available_for_daily,
@@ -122,6 +130,7 @@ class CreateMenuItemRequest(BaseModel):
     description: Optional[str] = Field(None, max_length=1000)
     category: str
     price: float = Field(..., gt=0)
+    variations: List[MenuItemVariation] = []
     image_url: Optional[str] = None
     is_available_for_daily: bool = True
     is_available_for_meal_plan: bool = False
@@ -136,6 +145,7 @@ class UpdateMenuItemRequest(BaseModel):
     description: Optional[str] = Field(None, max_length=1000)
     category: Optional[str] = None
     price: Optional[float] = Field(None, gt=0)
+    variations: Optional[List[MenuItemVariation]] = None
     image_url: Optional[str] = None
     is_available: Optional[bool] = None
     is_available_for_daily: Optional[bool] = None

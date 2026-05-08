@@ -1,4 +1,4 @@
-from typing import Dict, List
+from typing import Dict, List, Optional
 from bson import ObjectId
 from app.config.database import get_database
 from app.services.menu_service import menu_service
@@ -39,7 +39,7 @@ class CartService:
             cart["_id"] = result.inserted_id
         return cart
 
-    async def add_to_cart(self, user_id: str, item_id: str, quantity: int) -> Dict:
+    async def add_to_cart(self, user_id: str, item_id: str, quantity: int, variation_size: Optional[str] = None) -> Dict:
         if quantity <= 0:
             raise ValueError("Quantity must be positive")
 
@@ -50,14 +50,30 @@ class CartService:
         if not menu_item:
             raise ValueError("Menu item not found")
 
+        # Determine price and variation
+        item_price = menu_item.price
+        variation_size_to_store = None
+        
+        if variation_size:
+            variations_list = getattr(menu_item, 'variations', []) or []
+            variation = next(
+                (v for v in variations_list if isinstance(v, dict) and v.get("size", "").lower() == variation_size.lower()),
+                None,
+            )
+            if variation and variation.get("is_available"):
+                item_price = variation.get("price", menu_item.price)
+                variation_size_to_store = variation.get("size")
+            else:
+                raise ValueError(f"Variation '{variation_size}' not available for this item")
+
         existing_item = next(
-            (item for item in cart["items"] if item["item_id"] == item_id),
+            (item for item in cart["items"] if item["item_id"] == item_id and item.get("variation_size") == variation_size_to_store),
             None,
         )
 
         if existing_item:
             await self.carts.update_one(
-                {"user_id": ObjectId(user_id), "items.item_id": item_id},
+                {"user_id": ObjectId(user_id), "items.item_id": item_id, "items.variation_size": variation_size_to_store},
                 {"$inc": {"items.$.quantity": quantity}},
             )
         else:
@@ -65,8 +81,9 @@ class CartService:
                 "item_id": item_id,
                 "item_name": menu_item.name,
                 "category": menu_item.category,
-                "price": menu_item.price,
+                "price": item_price,
                 "quantity": quantity,
+                "variation_size": variation_size_to_store,
             }
             await self.carts.update_one(
                 {"user_id": ObjectId(user_id)},
@@ -75,30 +92,30 @@ class CartService:
 
         return await self.get_cart_summary(user_id)
 
-    async def update_cart_item(self, user_id: str, item_id: str, quantity: int) -> Dict:
+    async def update_cart_item(self, user_id: str, item_id: str, quantity: int, variation_size: Optional[str] = None) -> Dict:
         if self.carts is None:
             raise ValueError("Carts collection not available")
 
         if quantity <= 0:
             await self.carts.update_one(
                 {"user_id": ObjectId(user_id)},
-                {"$pull": {"items": {"item_id": item_id}}},
+                {"$pull": {"items": {"item_id": item_id, "variation_size": variation_size}}},
             )
         else:
             await self.carts.update_one(
-                {"user_id": ObjectId(user_id), "items.item_id": item_id},
+                {"user_id": ObjectId(user_id), "items.item_id": item_id, "items.variation_size": variation_size},
                 {"$set": {"items.$.quantity": quantity}},
             )
 
         return await self.get_cart_summary(user_id)
 
-    async def remove_from_cart(self, user_id: str, item_id: str) -> Dict:
+    async def remove_from_cart(self, user_id: str, item_id: str, variation_size: Optional[str] = None) -> Dict:
         if self.carts is None:
             raise ValueError("Carts collection not available")
 
         await self.carts.update_one(
             {"user_id": ObjectId(user_id)},
-            {"$pull": {"items": {"item_id": item_id}}},
+            {"$pull": {"items": {"item_id": item_id, "variation_size": variation_size}}},
         )
         return await self.get_cart_summary(user_id)
 
@@ -117,6 +134,7 @@ class CartService:
                     "quantity": item["quantity"],
                     "price": item["price"],
                     "subtotal": item_subtotal,
+                    "variation_size": item.get("variation_size"),
                 }
             )
             subtotal += item_subtotal

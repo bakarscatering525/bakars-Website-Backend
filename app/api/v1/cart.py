@@ -33,6 +33,7 @@ async def add_to_cart(
             str(current_user.id),
             request.item_id,
             request.quantity,
+            request.variation_size,
         )
         
         return ApiResponse(
@@ -58,6 +59,7 @@ async def update_cart_item(
             str(current_user.id),
             item_id,
             request.quantity,
+            request.variation_size,
         )
         
         return ApiResponse(
@@ -72,6 +74,7 @@ async def update_cart_item(
 @router.delete("/remove-item/{item_id}", response_model=ApiResponse[CartSummary])
 async def remove_from_cart(
     item_id: str,
+    variation_size: str = None,
     current_user = Depends(get_current_user)
 ):
     """Remove item from cart"""
@@ -79,6 +82,7 @@ async def remove_from_cart(
         summary = await cart_service.remove_from_cart(
             str(current_user.id),
             item_id,
+            variation_size,
         )
         
         return ApiResponse(

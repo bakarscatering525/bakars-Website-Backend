@@ -69,6 +69,7 @@ def item_to_response(item) -> MenuItemResponse:
         description=item.description,
         category=item.category,
         price=item.price,
+        variations=getattr(item, 'variations', []) or [],
         image_url=image_url,
         is_available=item.is_available,
         is_available_for_daily=item.is_available_for_daily,
