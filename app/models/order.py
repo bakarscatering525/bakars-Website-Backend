@@ -27,6 +27,7 @@ class OrderModel(BaseModel):
     
     # Pricing
     subtotal: float
+    discount_amount: float = 0.0
     tax_amount: float = 0.0
     delivery_fee: float
     total_amount: float

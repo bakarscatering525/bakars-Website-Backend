@@ -42,6 +42,7 @@ def order_to_response(order) -> OrderResponse:
         items=order.items,
         sidelines=getattr(order, "sidelines", []),
         subtotal=order.subtotal,
+        discount_amount=getattr(order, "discount_amount", 0.0),
         tax_amount=getattr(order, "tax_amount", 0.0),
         delivery_fee=order.delivery_fee,
         total_amount=order.total_amount,

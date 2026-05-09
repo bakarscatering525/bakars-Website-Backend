@@ -106,6 +106,8 @@ class DeliverySlotSelection(BaseModel):
 
     delivery_date: datetime
     menu_items: Dict[str, int]  # {menu_item_id: quantity}
+    variation_sizes: Dict[str, str] = Field(default_factory=dict)  # {menu_item_id: "small"|"medium"|"large"}
+    fulfilment_method: Optional[str] = None  # delivery|pickup
     notes: Optional[str] = None
     cutoff_at: Optional[datetime] = None
     locked_at: Optional[datetime] = None

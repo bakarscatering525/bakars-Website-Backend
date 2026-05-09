@@ -91,10 +91,13 @@ class DeliveryService:
         match = re.search(r'\b(\d{4})\b', address)
         return match.group(1) if match else None
 
-    async def _find_zone_by_postcode(self, postcode: Optional[str]) -> Optional[dict]:
+    async def _find_zone_by_postcode(
+        self, postcode: Optional[str], order_type: Optional[str] = None
+    ) -> Optional[dict]:
         """Lookup delivery zone by postcode if available."""
         if not postcode:
             return None
+        _ = order_type
 
         if self.zones is None:
             for zone in DEFAULT_MEAL_DELIVERY_ZONES:
@@ -103,80 +106,116 @@ class DeliveryService:
             return None
 
         await self.ensure_default_zones()
-        cursor = self.zones.find({"postcode": postcode, "is_active": True}).sort("base_delivery_fee", 1)
+        query: Dict[str, object] = {"postcode": postcode, "is_active": True}
+        cursor = self.zones.find(query).sort("base_delivery_fee", 1)
         matches = await cursor.to_list(length=1)
         return matches[0] if matches else None
     
-    async def check_daily_delivery(self, address: str) -> Tuple[bool, Optional[float], Optional[dict], Optional[str]]:
+    async def check_daily_delivery(
+        self, address: str
+    ) -> Tuple[bool, Optional[float], Optional[dict], Optional[str], float]:
         """
         Check if address is within daily delivery range.
 
         Returns:
-            (is_available, distance_km, geocoded_address, failure_reason)
+            (is_available, distance_km, geocoded_address, failure_reason, delivery_fee)
         """
         try:
             failure_reason = None
+            delivery_fee = DAILY_DELIVERY_FEE
 
             if self.gmaps:
                 # Use Google Maps for accurate geocoding
-                geocode_result = self.gmaps.geocode(address)
+                try:
+                    geocode_result = self.gmaps.geocode(address)
+                except Exception as e:
+                    logger.warning(f"Google Maps geocode failed, falling back to postcode coverage: {e}")
+                    geocode_result = None
 
                 if not geocode_result:
-                    failure_reason = (
-                        "We could not verify this address. Please double-check the details "
-                        "or select another address within our delivery area."
+                    # Fall back to postcode coverage below
+                    self.gmaps = None
+                else:
+                    location = geocode_result[0]['geometry']['location']
+                    lat = location['lat']
+                    lng = location['lng']
+
+                    # Calculate distance
+                    distance = calculate_distance(
+                        self.business_lat, self.business_lng,
+                        lat, lng
                     )
-                    return False, None, None, failure_reason
 
-                location = geocode_result[0]['geometry']['location']
-                lat = location['lat']
-                lng = location['lng']
+                    formatted_address = geocode_result[0]['formatted_address']
+                    postcode = self._extract_postcode(formatted_address)
+                    zone = await self._find_zone_by_postcode(postcode, order_type="daily")
 
-                # Calculate distance
-                distance = calculate_distance(
-                    self.business_lat, self.business_lng,
-                    lat, lng
-                )
+                radius_km: Optional[float] = DAILY_DELIVERY_RADIUS
+                if zone and zone.get("distance_from_business") is not None:
+                    try:
+                        radius_km = float(zone.get("distance_from_business"))
+                    except (TypeError, ValueError):
+                        radius_km = DAILY_DELIVERY_RADIUS
 
-                is_available = distance <= DAILY_DELIVERY_RADIUS
+                is_available = distance <= (radius_km if radius_km is not None else DAILY_DELIVERY_RADIUS)
                 if not is_available:
                     failure_reason = (
                         f"This address is {distance:.1f}km away. "
-                        f"Daily delivery is limited to {DAILY_DELIVERY_RADIUS:.0f}km from Guildford."
+                        f"Delivery is limited to {(radius_km if radius_km is not None else DAILY_DELIVERY_RADIUS):.0f}km."
                     )
 
+                if zone and is_available:
+                    delivery_fee = float(zone.get("base_delivery_fee") or DAILY_DELIVERY_FEE)
+                else:
+                    delivery_fee = DAILY_DELIVERY_FEE if is_available else 0.0
+
                 geocoded_data = {
-                    "formatted_address": geocode_result[0]['formatted_address'],
+                    "formatted_address": formatted_address,
                     "latitude": lat,
                     "longitude": lng
                 }
 
-                logger.info(f"Daily delivery check: {address} - {distance}km - Available: {is_available}")
-                return is_available, distance, geocoded_data, failure_reason
+                logger.info(
+                    "Daily delivery check: %s - %skm - fee=%s - postcode=%s",
+                    address,
+                    distance,
+                    delivery_fee,
+                    postcode,
+                )
+                return is_available, distance, geocoded_data, failure_reason, delivery_fee
 
             # Fallback: Simple postcode-based check
             logger.info("Using fallback delivery check (postcode-based)")
 
             postcode = self._extract_postcode(address)
             if postcode:
-                zone = await self.check_postcode_coverage(postcode)
+                zone_doc = await self._find_zone_by_postcode(postcode, order_type="daily")
+                if zone_doc:
+                    approximate_distance = zone_doc.get("distance_from_business")
+                    delivery_fee = float(zone_doc.get("base_delivery_fee") or DAILY_DELIVERY_FEE)
+                    geocoded_data = {
+                        "formatted_address": address,
+                        "latitude": self.business_lat,
+                        "longitude": self.business_lng
+                    }
+                    return True, approximate_distance, geocoded_data, None, delivery_fee
 
+                zone = await self.check_postcode_coverage(postcode)
                 if zone and zone.get("is_covered"):
-                    distance = zone.get("distance_km", 5.0)
-                    is_available = distance <= DAILY_DELIVERY_RADIUS
+                    distance = zone.get("distance_km", 0.0)
+                    is_available = distance <= DAILY_DELIVERY_RADIUS if distance is not None else False
                     if not is_available:
                         failure_reason = (
-                            f"Daily delivery is limited to {DAILY_DELIVERY_RADIUS:.0f}km from Guildford. "
-                            f"This address is approximately {distance:.1f}km away."
+                            f"Daily delivery is limited to {DAILY_DELIVERY_RADIUS:.0f}km from Guildford."
                         )
+                        return False, distance, None, failure_reason, 0.0
 
                     geocoded_data = {
                         "formatted_address": address,
                         "latitude": self.business_lat,
                         "longitude": self.business_lng
                     }
-
-                    return is_available, distance, geocoded_data, failure_reason
+                    return True, distance, geocoded_data, None, DAILY_DELIVERY_FEE
 
             failure_reason = (
                 f"We currently deliver daily orders within {DAILY_DELIVERY_RADIUS:.0f}km of Guildford. "
@@ -186,14 +225,14 @@ class DeliveryService:
                 "formatted_address": address,
                 "latitude": self.business_lat,
                 "longitude": self.business_lng
-            }, failure_reason
+            }, failure_reason, 0.0
 
         except Exception as e:
             logger.error(f"Error checking daily delivery: {e}")
             return False, None, None, (
                 "Unable to verify address for daily delivery right now. "
                 "Please try again or contact support."
-            )
+            ), 0.0
     
     async def calculate_weekly_delivery_fee(
         self, 
@@ -215,31 +254,54 @@ class DeliveryService:
             lng = self.business_lng
 
             if self.gmaps:
-                geocode_result = self.gmaps.geocode(address)
+                try:
+                    geocode_result = self.gmaps.geocode(address)
+                except Exception as e:
+                    logger.warning(f"Google Maps geocode failed, falling back to postcode coverage: {e}")
+                    geocode_result = None
 
                 if not geocode_result:
-                    raise ValueError("Invalid address")
+                    geocode_result = None
+                else:
+                    formatted_address = geocode_result[0]['formatted_address']
+                    location = geocode_result[0]['geometry']['location']
+                    lat = location['lat']
+                    lng = location['lng']
+                    distance = calculate_distance(
+                        self.business_lat, self.business_lng, lat, lng
+                    )
 
-                formatted_address = geocode_result[0]['formatted_address']
-                location = geocode_result[0]['geometry']['location']
-                lat = location['lat']
-                lng = location['lng']
-                distance = calculate_distance(
-                    self.business_lat, self.business_lng, lat, lng
-                )
+                if geocode_result is None:
+                    formatted_address = address
+                    distance = None
+                    lat = self.business_lat
+                    lng = self.business_lng
 
             postcode = self._extract_postcode(formatted_address)
-            zone = await self._find_zone_by_postcode(postcode)
+            zone = await self._find_zone_by_postcode(postcode, order_type="meal_subscription")
 
             if not postcode or not zone:
                 raise ValueError("Delivery is not available to this postcode.")
 
-            if zone and zone.get("distance_from_business") is not None:
-                distance = zone["distance_from_business"]
+            max_distance_km = zone.get("distance_from_business")
+            if max_distance_km is not None:
+                try:
+                    max_distance_km = float(max_distance_km)
+                except (TypeError, ValueError):
+                    max_distance_km = None
 
             if distance is None:
-                distance = calculate_distance(
+                distance = max_distance_km if max_distance_km is not None else calculate_distance(
                     self.business_lat, self.business_lng, lat, lng
+                )
+
+            if (
+                max_distance_km is not None
+                and distance is not None
+                and distance > max_distance_km
+            ):
+                raise ValueError(
+                    f"Delivery is not available beyond {max_distance_km:.0f}km for this postcode."
                 )
 
             geocoded_data = {

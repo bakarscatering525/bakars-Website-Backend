@@ -23,7 +23,7 @@ async def check_delivery_availability(request: CheckAvailabilityRequest):
     """Check if address is within delivery range"""
     try:
         if request.order_type == "daily":
-            is_available, distance, geocoded, failure_reason = await delivery_service.check_daily_delivery(request.address)
+            is_available, distance, geocoded, failure_reason, delivery_fee = await delivery_service.check_daily_delivery(request.address)
             
             if is_available:
                 return ApiResponse(
@@ -31,7 +31,7 @@ async def check_delivery_availability(request: CheckAvailabilityRequest):
                     data=DeliveryCheckResponse(
                         available=True,
                         distance_km=distance,
-                        delivery_fee=DAILY_DELIVERY_FEE,
+                        delivery_fee=delivery_fee,
                         message="Delivery available to this address"
                     )
                 )
@@ -52,7 +52,7 @@ async def check_delivery_availability(request: CheckAvailabilityRequest):
         else:
             # Weekly/Catering - must match an active delivery zone (postcode-based)
             postcode = delivery_service._extract_postcode(request.address)
-            zone = await delivery_service._find_zone_by_postcode(postcode)
+            zone = await delivery_service._find_zone_by_postcode(postcode, order_type=request.order_type)
             if not zone:
                 return ApiResponse(
                     success=True,

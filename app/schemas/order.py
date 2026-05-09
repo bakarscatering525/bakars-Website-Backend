@@ -108,6 +108,7 @@ class OrderResponse(BaseModel):
     items: List[OrderItem]
     sidelines: Optional[List[OrderItem]] = None
     subtotal: float
+    discount_amount: Optional[float] = 0.0
     tax_amount: Optional[float] = 0.0
     delivery_fee: float
     total_amount: float

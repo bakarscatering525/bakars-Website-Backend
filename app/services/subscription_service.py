@@ -210,6 +210,7 @@ class MealSubscriptionService:
             "description": item.description,
             "category": item.category,
             "price": item.price,
+            "variations": getattr(item, "variations", []) or [],
             "image_url": getattr(item, "image_url", None),
             "is_available": getattr(item, "is_available", True),
             "is_available_for_daily": getattr(item, "is_available_for_daily", False),

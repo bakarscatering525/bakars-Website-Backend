@@ -123,14 +123,14 @@ class OrderService:
             if delivery_method == "standard":
                 # Check delivery availability
                 address_str = f"{delivery_address['street']}, {delivery_address['suburb']}, {delivery_address['postcode']}"
-                is_available, distance, geocoded, failure_reason = await delivery_service.check_daily_delivery(address_str)
+                is_available, distance, geocoded, failure_reason, computed_fee = await delivery_service.check_daily_delivery(address_str)
                 
                 if not is_available:
                     message = failure_reason or "Daily delivery is restricted to addresses within 6km of Guildford."
                     logger.warning(f"Daily order blocked for address '{address_str}': {message}")
                     raise ValueError(message)
                 
-                delivery_fee = DAILY_DELIVERY_FEE
+                delivery_fee = computed_fee if computed_fee is not None else DAILY_DELIVERY_FEE
                 if geocoded:
                     delivery_address["latitude"] = geocoded.get("latitude")
                     delivery_address["longitude"] = geocoded.get("longitude")
@@ -221,7 +221,6 @@ class OrderService:
         plan_records: List[Dict[str, Any]] = []
         total_included_boxes = 0
         plan_base_total = 0.0
-        max_boxes_per_meal_total = 0
         has_regular_plan = False
         has_subscription_plan = False
         now = get_business_now()
@@ -268,9 +267,6 @@ class OrderService:
             included_boxes = (plan.included_meals or 0) * quantity
             plan_price = (plan.price_per_plan or 0.0) * quantity
 
-            if plan.max_boxes_per_meal:
-                max_boxes_per_meal_total += plan.max_boxes_per_meal * quantity
-
             total_included_boxes += included_boxes
             plan_base_total += plan_price
             has_regular_plan = has_regular_plan or plan.tab == "regular"
@@ -297,12 +293,29 @@ class OrderService:
         delivery_slot_models: List[DeliverySlotSelection] = []
         menu_totals: Dict[str, int] = defaultdict(int)
         unique_delivery_dates = set()
+        unique_delivery_dates_delivery = set()
 
         for slot in delivery_slots:
             date_str = slot.get("delivery_date")
             menu_items = slot.get("menu_items", {})
             if not date_str or not menu_items:
                 continue
+
+            slot_fulfilment = (slot.get("fulfilment_method") or fulfilment).lower()
+            if slot_fulfilment not in {"delivery", "pickup"}:
+                slot_fulfilment = fulfilment
+
+            raw_variation_sizes = slot.get("variation_sizes") or {}
+            slot_variation_sizes: Dict[str, str] = {}
+            if isinstance(raw_variation_sizes, dict):
+                for raw_id, raw_size in raw_variation_sizes.items():
+                    if raw_id is None or raw_size is None:
+                        continue
+                    item_id = str(raw_id).strip()
+                    size = str(raw_size).strip().lower()
+                    if not item_id or not size:
+                        continue
+                    slot_variation_sizes[item_id] = size
 
             delivery_date = parse_date(date_str)
             date_key = delivery_date.date().isoformat()
@@ -353,6 +366,8 @@ class OrderService:
                 DeliverySlotSelection(
                     delivery_date=delivery_date,
                     menu_items=normalized_menu_items,
+                    variation_sizes=slot_variation_sizes,
+                    fulfilment_method=slot_fulfilment,
                     notes=slot.get("notes"),
                     cutoff_at=cutoff_at_utc,
                     locked_at=lock_timestamp,
@@ -360,6 +375,8 @@ class OrderService:
             )
 
             unique_delivery_dates.add(date_str)
+            if slot_fulfilment == "delivery":
+                unique_delivery_dates_delivery.add(date_str)
 
             for item_id, quantity in normalized_menu_items.items():
                 menu_totals[item_id] += int(quantity)
@@ -404,9 +421,6 @@ class OrderService:
         if fulfilment == "pickup" and has_regular_plan and total_selected_boxes < REGULAR_PICKUP_MIN_BOXES:
             raise ValueError(f"Regular pickup orders require at least {REGULAR_PICKUP_MIN_BOXES} box")
 
-        remaining_included_boxes = total_included_boxes
-        per_item_cap = max_boxes_per_meal_total if max_boxes_per_meal_total > 0 else None
-
         # Cache menu items to avoid repeated lookups
         menu_item_cache: Dict[str, Any] = {}
 
@@ -417,60 +431,76 @@ class OrderService:
             menu_item_cache[item_id] = menu_item
             return menu_item
 
-        # Compute extras per delivery slot so per-item caps are applied per delivery day,
-        # and included boxes are filled before charging extras.
-        extra_per_item: Dict[str, int] = defaultdict(int)
-        extra_boxes = 0
-        extra_boxes_price = 0.0
         add_on_total = 0.0
+
+        def resolve_unit_price(menu_item: Any, variation_size: Optional[str]) -> float:
+            base = float(getattr(menu_item, "price", 0.0) or 0.0)
+            if not variation_size:
+                return base
+            size = str(variation_size).strip().lower()
+            variations = getattr(menu_item, "variations", None) or []
+            for variation in variations:
+                try:
+                    v_size = str(variation.get("size", "")).strip().lower()
+                except Exception:
+                    v_size = ""
+                if v_size != size:
+                    continue
+                try:
+                    is_available = bool(variation.get("is_available", True))
+                except Exception:
+                    is_available = True
+                if not is_available:
+                    continue
+                try:
+                    return float(variation.get("price", base) or base)
+                except Exception:
+                    return base
+            return base
+
+        # Build priced order items (group by item + variation size) and compute subtotal.
+        item_totals: Dict[tuple[str, Optional[str]], Dict[str, Any]] = defaultdict(
+            lambda: {"quantity": 0, "unit_price": 0.0, "name": "", "category": ""}
+        )
+        meals_subtotal = 0.0
 
         for slot in delivery_slot_models:
             for item_id, quantity in slot.menu_items.items():
                 menu_item = await get_menu_item_cached(item_id)
-                if not menu_item or not menu_item.is_available:
+                if not menu_item or not getattr(menu_item, "is_available", True):
                     raise ValueError(f"Menu item {item_id} is no longer available")
-                if has_subscription_plan and not menu_item.is_available_for_meal_plan:
+                if has_subscription_plan and not getattr(menu_item, "is_available_for_meal_plan", False):
                     raise ValueError(f"{getattr(menu_item, 'name', item_id)} is not available for meal subscriptions")
 
                 qty = int(quantity)
                 if qty <= 0:
                     continue
 
-                eligible = min(qty, per_item_cap) if per_item_cap is not None else qty
-                extras_from_cap = qty - eligible
+                variation_size = (slot.variation_sizes or {}).get(item_id)
+                unit_price = resolve_unit_price(menu_item, variation_size)
+                meals_subtotal += unit_price * qty
 
-                covered = min(eligible, remaining_included_boxes)
-                remaining_included_boxes = max(0, remaining_included_boxes - covered)
+                key = (str(menu_item.id), variation_size)
+                item_totals[key]["quantity"] += qty
+                item_totals[key]["unit_price"] = unit_price
+                item_totals[key]["name"] = getattr(menu_item, "name", "Item")
+                item_totals[key]["category"] = getattr(menu_item, "category", "")
 
-                extras_from_limit = max(0, eligible - covered)
-                extra_qty = extras_from_cap + extras_from_limit
-
-                if extra_qty > 0:
-                    extra_per_item[item_id] += extra_qty
-                    extra_boxes += extra_qty
-                    extra_boxes_price += extra_qty * menu_item.price
-
-        # Build order items with extra subtotals using the per-item extra counts above.
         order_items: List[OrderItem] = []
-        for item_id, quantity in menu_totals.items():
-            menu_item = await get_menu_item_cached(item_id)
-            if not menu_item or not menu_item.is_available:
-                raise ValueError(f"Menu item {item_id} is no longer available")
-
-            if has_subscription_plan and not menu_item.is_available_for_meal_plan:
-                raise ValueError(f"{menu_item.name} is not available for meal subscriptions")
-
-            extra_quantity = extra_per_item.get(item_id, 0)
-            item_subtotal = menu_item.price * extra_quantity
-
+        for (resolved_id, variation_size), payload in item_totals.items():
+            label = payload["name"]
+            if variation_size:
+                label = f"{label} ({variation_size})"
+            quantity = int(payload["quantity"])
+            unit_price = float(payload["unit_price"])
             order_items.append(
                 OrderItem(
-                    item_id=str(menu_item.id),
-                    item_name=menu_item.name,
-                    category=menu_item.category,
+                    item_id=resolved_id,
+                    item_name=label,
+                    category=str(payload["category"]),
                     quantity=quantity,
-                    price=menu_item.price,
-                    subtotal=item_subtotal
+                    price=unit_price,
+                    subtotal=unit_price * quantity,
                 )
             )
 
@@ -514,15 +544,27 @@ class OrderService:
                 )
                 add_on_total += sideline_subtotal
 
-        subtotal = plan_base_total + extra_boxes_price
-        subtotal += add_on_total
-        tax_amount = round(subtotal * 0.10, 2)
+        # Deal discount rules (updated):
+        # - Weekly: flat $20 off, any quantity.
+        # - Fortnight: flat $50 off, requires 20+ meals selected.
+        discount_amount = 0.0
+        if primary_plan_tab == "weekly" and total_selected_boxes > 0:
+            discount_amount = 20.0
+        elif primary_plan_tab == "fortnight":
+            if total_selected_boxes < 20:
+                raise ValueError("Please select at least 20 meals to unlock the $50 deal.")
+            discount_amount = 50.0
 
-        delivery_days = len(unique_delivery_dates)
+        subtotal = meals_subtotal + add_on_total
+        subtotal_after_discount = max(0.0, subtotal - discount_amount)
+        tax_amount = round(subtotal_after_discount * 0.10, 2)
+
+        delivery_days = len(unique_delivery_dates_delivery)
         delivery_fee = 0.0
         delivery_fee_per_day = 0.0
+        has_any_delivery = delivery_days > 0
 
-        if fulfilment == "delivery":
+        if has_any_delivery:
             address_required_fields = ["street", "suburb", "postcode"]
             if any(field not in address_data for field in address_required_fields):
                 raise ValueError("Delivery address is incomplete")
@@ -530,7 +572,7 @@ class OrderService:
             address_str = f"{address_data['street']}, {address_data['suburb']}, {address_data['postcode']}"
             delivery_fee, distance, geocoded = await delivery_service.calculate_weekly_delivery_fee(
                 address_str,
-                subtotal,
+                subtotal_after_discount,
                 max(delivery_days, 1),
                 is_express
             )
@@ -545,7 +587,7 @@ class OrderService:
             address_data = {"fulfilment": "pickup"}
             delivery_address_id = None
 
-        total_amount = subtotal + tax_amount + delivery_fee
+        total_amount = subtotal_after_discount + tax_amount + delivery_fee
 
         plan_selection_models = []
         for record in plan_records:
@@ -580,12 +622,14 @@ class OrderService:
             "items": [item.dict() for item in order_items],
             "sidelines": [item.dict() for item in sideline_items],
             "subtotal": subtotal,
+            "discount_amount": discount_amount,
             "tax_amount": tax_amount,
             "delivery_fee": delivery_fee,
             "total_amount": total_amount,
-            "plan_price_total": plan_base_total,
+            "plan_price_total": 0.0,
             "delivery_method": (
-                "pickup" if fulfilment == "pickup"
+                "pickup"
+                if not has_any_delivery
                 else ("express" if is_express else "standard")
             ),
             "delivery_address": address_data,
@@ -595,26 +639,30 @@ class OrderService:
             "payment_method": (payment_method or "cash").lower(),
             "primary_plan_tab": primary_plan_tab,
             "primary_plan_name": primary_plan_name,
-            "extra_boxes": extra_boxes,
-            "extra_boxes_price": extra_boxes_price,
+            "extra_boxes": 0,
+            "extra_boxes_price": 0.0,
         }
 
         subscription_payload = {
             "user_id": ObjectId(user_id),
-            "fulfilment_type": fulfilment,
-            "postal_code": address_data.get("postcode") if fulfilment == "delivery" else None,
+            "fulfilment_type": (
+                "mixed"
+                if has_any_delivery and len(unique_delivery_dates) > len(unique_delivery_dates_delivery)
+                else ("delivery" if has_any_delivery else "pickup")
+            ),
+            "postal_code": address_data.get("postcode") if has_any_delivery else None,
             "plan_selections": [selection.dict() for selection in plan_selection_models],
             "delivery_slots": [slot.dict() for slot in delivery_slot_models],
             "total_selected_boxes": total_selected_boxes,
             "total_included_boxes": total_included_boxes,
-            "extra_boxes": extra_boxes,
-            "extra_boxes_price": extra_boxes_price,
+            "extra_boxes": 0,
+            "extra_boxes_price": 0.0,
             "tax_amount": tax_amount,
-            "plan_price_total": plan_base_total,
+            "plan_price_total": 0.0,
             "delivery_days": delivery_days,
             "delivery_fee_per_day": delivery_fee_per_day,
             "total_delivery_fee": delivery_fee,
-            "express_delivery": fulfilment == "delivery" and is_express,
+            "express_delivery": has_any_delivery and is_express,
             "delivery_fee_notes": None,
             "reminder_settings": (
                 primary_plan.reminder_settings.dict()

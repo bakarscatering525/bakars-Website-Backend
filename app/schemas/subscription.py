@@ -281,6 +281,8 @@ class PlanSelectionPayload(BaseModel):
 class DeliverySlotPayload(BaseModel):
     delivery_date: str  # ISO date
     menu_items: Dict[str, int]
+    variation_sizes: Optional[Dict[str, str]] = None
+    fulfilment_method: Optional[str] = None  # delivery|pickup
     notes: Optional[str] = None
 
     @validator("delivery_date")
@@ -294,3 +296,36 @@ class DeliverySlotPayload(BaseModel):
         if not value:
             raise ValueError("menu_items must include at least one item")
         return value
+
+    @validator("variation_sizes", pre=True)
+    def normalize_variation_sizes(
+        cls, value: Optional[Dict[str, str]]
+    ) -> Optional[Dict[str, str]]:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise ValueError("variation_sizes must be a mapping of item IDs to variation size")
+        normalized: Dict[str, str] = {}
+        allowed = {"small", "medium", "large"}
+        for raw_id, raw_size in value.items():
+            if raw_id is None:
+                continue
+            item_id = str(raw_id).strip()
+            if not item_id:
+                continue
+            size = str(raw_size).strip().lower() if raw_size is not None else ""
+            if not size:
+                continue
+            if size not in allowed:
+                raise ValueError(f"Invalid variation size '{raw_size}'. Must be one of: small, medium, large")
+            normalized[item_id] = size
+        return normalized or None
+
+    @validator("fulfilment_method", pre=True)
+    def normalize_fulfilment_method(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = str(value).strip().lower()
+        if normalized not in {"delivery", "pickup"}:
+            raise ValueError("fulfilment_method must be 'delivery' or 'pickup'")
+        return normalized
