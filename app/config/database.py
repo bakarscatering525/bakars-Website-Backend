@@ -28,6 +28,25 @@ async def connect_to_mongo():
     mongodb_uri = settings.MONGODB_URL or ""
     allow_doh_fallback = mongodb_uri.startswith("mongodb+srv://") and not settings.MONGODB_FORCE_DOH
 
+    if not mongodb_uri.strip():
+        try:
+            from mongomock_motor import AsyncMongoMockClient  # type: ignore
+        except Exception as exc:
+            logger.error(
+                "MONGODB_URL is not set and mongomock-motor is not available. "
+                "Set MONGODB_URL or install mongomock-motor to run without MongoDB."
+            )
+            raise
+
+        database.client = AsyncMongoMockClient()
+        database.db = database.client[settings.MONGODB_DB_NAME]
+        logger.warning(
+            "Started with in-memory MongoDB mock (mongomock-motor) for DB: %s",
+            settings.MONGODB_DB_NAME,
+        )
+        await create_indexes()
+        return
+
     while True:
         try:
             if settings.MONGODB_DNS_SERVERS:
